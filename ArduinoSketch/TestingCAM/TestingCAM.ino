@@ -4,8 +4,8 @@
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char* ssid = "TP-Link_09F8";
-const char* password = "Tejas@1305";
+const char* ssid = "YourWIFISSID";
+const char* password = "YourWIFIPassword";
 
 // Manual pin configuration (AI Thinker or similar)
 #define PWDN_GPIO_NUM     32
