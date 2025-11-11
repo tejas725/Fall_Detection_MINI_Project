@@ -1,13 +1,16 @@
 /*
-  FallDetect_ESP32CAM_updated.ino
-  - Uses MPU6050 (I2C on SDA=GPIO15, SCL=GPIO14)
-  - MAX30102 heart-sensor (I2C shared)
+  FallDetect_ESP32CAM_withWeb.ino
+  - ESP32-CAM (AI-Thinker / OV2640) camera + WebServer to view camera at http://<IP>/
+  - MPU6050 (I2C SDA=GPIO15, SCL=GPIO14)
+  - MAX30102 (I2C shared)
   - PIR -> GPIO13
   - Buzzer -> GPIO2
   - LED -> GPIO4
-  - Camera: built-in (AI-Thinker / OV2640 board)
-  - When fall detected: capture JPEG and POST to SERVER_UPLOAD_URL
-  - Continuous BPM monitoring; when HR is out of range, optional alert
+  - Fall detection still works; captureAndSend() will capture and optionally POST if SERVER_UPLOAD_URL is set.
+  - New: starts an HTTP server (port 80) with:
+      /         -> HTML page with links
+      /capture  -> single JPEG image (Content-Type: image/jpeg)
+      /stream   -> MJPEG stream (multipart/x-mixed-replace) for live preview
 */
 
 #include "esp_camera.h"
@@ -17,14 +20,16 @@
 #include "MPU6050_light.h"
 #include <MAX30105.h>
 #include "heartRate.h"
+#include <WebServer.h>
 
 // ----------------- USER CONFIG -----------------
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASS";
-// POST endpoint that accepts raw JPEG (Content-Type: image/jpeg)
-const char* SERVER_UPLOAD_URL = "https://your-server.example/upload";
+const char* ssid = "WPU-LIBRARY";
+const char* password = "WpulibkrC@2524";
 
-// Pins (match wiring you confirmed)
+// Optional server (not required for local camera checking). If empty, POST will be skipped.
+const char* SERVER_UPLOAD_URL = "http://10.21.136.47/stream"; // e.g. "https://your-server.example/upload"
+
+// Pins (match your wiring)
 #define I2C_SDA 15   // SDA -> GPIO15
 #define I2C_SCL 14   // SCL -> GPIO14
 #define PIR_PIN 13
@@ -62,13 +67,14 @@ camera_config_t camera_config = {
   .ledc_channel   = LEDC_CHANNEL_0,
   .pixel_format   = PIXFORMAT_JPEG,
   .frame_size     = FRAMESIZE_SVGA,
-  .jpeg_quality   = 12, // 0-63 lower is better quality
+  .jpeg_quality   = 12,
   .fb_count       = 1
 };
 
 // ----------------- Globals -----------------
 MPU6050 mpu(Wire);
 MAX30105 particleSensor;
+WebServer server(80);
 
 unsigned long lastSpikeTime = 0;
 bool spikeSeen = false;
@@ -98,8 +104,12 @@ bool initCamera(){
   return true;
 }
 
-// Posts raw JPEG buffer to SERVER_UPLOAD_URL (Content-Type image/jpeg)
+// If SERVER_UPLOAD_URL is empty, skip POST step.
 bool postJPEGtoServer(const uint8_t* buf, size_t len, const char* reason) {
+  if (strlen(SERVER_UPLOAD_URL) == 0) {
+    Serial.println("SERVER_UPLOAD_URL not set — skipping POST");
+    return false;
+  }
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi not connected — cannot POST");
     return false;
@@ -109,26 +119,79 @@ bool postJPEGtoServer(const uint8_t* buf, size_t len, const char* reason) {
   http.addHeader("Content-Type", "image/jpeg");
   if (reason) http.addHeader("X-Event-Reason", reason);
 
-  // NOTE: HTTPClient::sendRequest expects uint8_t* (non-const) so cast here
-  int httpCode = http.sendRequest("POST", (uint8_t*)buf, len);   // <-- CAST FIX
+  // HTTPClient::sendRequest expects uint8_t* (non-const) so cast here
+  int httpCode = http.sendRequest("POST", (uint8_t*)buf, len);
 
   Serial.printf("POST returned: %d\n", httpCode);
   http.end();
   return (httpCode >= 200 && httpCode < 300);
 }
 
-void captureAndSend(const char* reason) {
-  Serial.println("Capturing image...");
+void captureAndSendLocal(const char* reason) {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed!");
     return;
   }
-  Serial.printf("Captured %u bytes\n", fb->len);
-  bool ok = postJPEGtoServer(fb->buf, fb->len, reason);
-  if (ok) Serial.println("Image posted successfully");
-  else Serial.println("Image post failed");
+  Serial.printf("Captured %u bytes (local)\n", fb->len);
+  // Optionally POST to external server if configured
+  postJPEGtoServer(fb->buf, fb->len, reason);
   esp_camera_fb_return(fb);
+}
+
+// ----------------- HTTP handlers -----------------
+
+// Root: simple HTML with links
+void handleRoot() {
+  String html = "<html><head><title>ESP32-CAM</title></head><body>";
+  html += "<h2>ESP32-CAM (OV2640)</h2>";
+  html += "<p><a href=\"/capture\">Capture single photo</a></p>";
+  html += "<p><a href=\"/stream\">Live stream (MJPEG)</a></p>";
+  html += "<p>Use <code>/capture</code> to download a snapshot as JPEG.</p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// Capture single JPEG and send as image/jpeg
+void handleCapture() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+  server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+// MJPEG streaming handler (multipart/x-mixed-replace)
+void handleStream() {
+  WiFiClient client = server.client();
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=esp32cam\r\n\r\n";
+  server.sendContent(response);
+
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Stream: Camera capture failed");
+      server.sendContent("Camera capture failed");
+      break;
+    }
+    String head = "--esp32cam\r\nContent-Type: image/jpeg\r\nContent-Length: " + String(fb->len) + "\r\n\r\n";
+    server.sendContent(head);
+    client.write(fb->buf, fb->len);
+    server.sendContent("\r\n");
+    esp_camera_fb_return(fb);
+
+    // small delay between frames
+    delay(100);
+  }
+}
+
+// NotFound handler
+void handleNotFound() {
+  server.send(404, "text/plain", "Not found");
 }
 
 // ----------------- Setup & Loop -----------------
@@ -150,16 +213,16 @@ void setup() {
   Serial.println("Init MPU6050...");
   mpu.begin();
   delay(100);
-  mpu.calcGyroOffsets();   // <-- LIBRARY-FRIENDLY CALL (no arg)
+  mpu.calcGyroOffsets();   // library-friendly no-arg
 
   // MAX30102 init
   Serial.println("Init MAX30102...");
   if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
     Serial.println("MAX30102 not found — check wiring!");
   } else {
-    particleSensor.setup(); // default setup
-    particleSensor.setPulseAmplitudeRed(0x0A); // tune LED brightness if needed
-    particleSensor.setPulseAmplitudeGreen(0);  // green not used for HR
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x0A);
+    particleSensor.setPulseAmplitudeGreen(0);
   }
 
   // Camera
@@ -171,7 +234,7 @@ void setup() {
   }
 
   // WiFi connect
-  Serial.printf("Connecting to WiFi %s\n", ssid);
+  Serial.printf("Connecting to WiFi SSID: %s\n", ssid);
   WiFi.begin(ssid, password);
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
@@ -180,17 +243,25 @@ void setup() {
   }
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println();
-    Serial.print("WiFi connected: ");
+    Serial.print("WiFi connected. IP: ");
     Serial.println(WiFi.localIP());
   } else {
     Serial.println();
-    Serial.println("WiFi connection failed (continue, will retry later)");
+    Serial.println("WiFi connection failed (continue, will retry in background).");
   }
+
+  // Start web server endpoints
+  server.on("/", handleRoot);
+  server.on("/capture", HTTP_GET, handleCapture);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("HTTP server started. Visit http://" + WiFi.localIP().toString() + "/ in your browser.");
 }
 
-unsigned long lastLoopMillis = 0;
 unsigned long lastHRSampleMillis = 0;
 const unsigned long HR_SAMPLE_INTERVAL = 25; // ms between reading samples from sensor
+unsigned long lastLoopMillis = 0;
 
 // Simple beat detection using SparkFun helper
 void processMAX30102() {
@@ -216,12 +287,15 @@ void processMAX30102() {
 void loop() {
   unsigned long now = millis();
 
+  // Handle webserver client requests
+  server.handleClient();
+
   // 1) MPU6050: update and compute accel magnitude in g
   mpu.update();
   float ax = mpu.getAccX();
   float ay = mpu.getAccY();
   float az = mpu.getAccZ();
-  float mag = sqrt(ax*ax + ay*ay + az*az); // in g (if library returns g)
+  float mag = sqrt(ax*ax + ay*ay + az*az);
 
   // detect spike
   if (mag > FALL_ACCEL_THRESHOLD) {
@@ -237,16 +311,14 @@ void loop() {
   if (spikeSeen && (now - lastSpikeTime <= FALL_TIME_WINDOW_MS)) {
     if (pir) {
       Serial.println("Fall confirmed (spike + PIR). Triggering actions.");
-      // sound and LED: 3 beeps (per your requirement)
       buzzOnce(3, 150, 120);
-      // capture & send image
-      captureAndSend("fall_detected");
+      // capture and optionally POST if SERVER_UPLOAD_URL set
+      captureAndSendLocal("fall_detected");
       spikeSeen = false;
-      // small cooldown to avoid repeated triggers
       delay(1200);
     }
   } else if (spikeSeen && (now - lastSpikeTime > FALL_TIME_WINDOW_MS)) {
-    spikeSeen = false; // timeout, ignore
+    spikeSeen = false;
   }
 
   // 3) Heart rate processing (continuous)
@@ -260,9 +332,9 @@ void loop() {
     lastVitalCheck = now;
     if (currentBPM > 0) {
       if (currentBPM < HR_LOW || currentBPM > HR_HIGH) {
-        Serial.printf("HR out of range: %.1f bpm — sending alert\n", currentBPM);
+        Serial.printf("HR out of range: %.1f bpm — local alert\n", currentBPM);
         buzzOnce(1, 200, 100);
-        captureAndSend("heart_rate_alert");
+        captureAndSendLocal("heart_rate_alert");
       } else {
         Serial.printf("HR OK: %.1f bpm\n", currentBPM);
       }
@@ -271,6 +343,6 @@ void loop() {
     }
   }
 
-  // small non-blocking delay
+  // tiny idle
   delay(10);
 }
