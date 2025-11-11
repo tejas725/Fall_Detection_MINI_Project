@@ -1,16 +1,13 @@
 /*
-  FallDetect_ESP32CAM_withWeb.ino
-  - ESP32-CAM (AI-Thinker / OV2640) camera + WebServer to view camera at http://<IP>/
+  FallDetect_ESP32CAM_withSD.ino
+  - ESP32-CAM (AI-Thinker / OV2640) camera + WebServer
+  - Saves every captured photo to microSD (SD_MMC)
   - MPU6050 (I2C SDA=GPIO15, SCL=GPIO14)
   - MAX30102 (I2C shared)
   - PIR -> GPIO13
   - Buzzer -> GPIO2
   - LED -> GPIO4
-  - Fall detection still works; captureAndSend() will capture and optionally POST if SERVER_UPLOAD_URL is set.
-  - New: starts an HTTP server (port 80) with:
-      /         -> HTML page with links
-      /capture  -> single JPEG image (Content-Type: image/jpeg)
-      /stream   -> MJPEG stream (multipart/x-mixed-replace) for live preview
+  - If SERVER_UPLOAD_URL set, it will POST the JPEG after saving to SD
 */
 
 #include "esp_camera.h"
@@ -21,13 +18,15 @@
 #include <MAX30105.h>
 #include "heartRate.h"
 #include <WebServer.h>
+#include "FS.h"
+#include "SD_MMC.h"
 
 // ----------------- USER CONFIG -----------------
-const char* ssid = "WPU-LIBRARY";
-const char* password = "WpulibkrC@2524";
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASS";
 
-// Optional server (not required for local camera checking). If empty, POST will be skipped.
-const char* SERVER_UPLOAD_URL = "http://10.21.136.47/stream"; // e.g. "https://your-server.example/upload"
+// Leave empty if you do not want to POST externally
+const char* SERVER_UPLOAD_URL = ""; // e.g. "https://your-server.example/upload"
 
 // Pins (match your wiring)
 #define I2C_SDA 15   // SDA -> GPIO15
@@ -83,6 +82,47 @@ unsigned long lastVitalCheck = 0;
 float currentBPM = 0.0;
 unsigned long lastBeatTime = 0;
 
+// ----------------- SD Functions -----------------
+
+bool initSD() {
+  // Try to mount SD card via SD_MMC (built-in slot on many ESP32-CAM boards)
+  if (!SD_MMC.begin()) {
+    Serial.println("SD_MMC.begin() failed. Check if card is inserted and formatted (FAT32).");
+    return false;
+  }
+  uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card mounted. Size: %llu MB\n", cardSize);
+  return true;
+}
+
+// Save camera framebuffer to SD card, return true if successful and set outPath
+bool savePhotoToSD(camera_fb_t* fb, String &outPath) {
+  if (!fb || fb->len == 0) {
+    Serial.println("savePhotoToSD: invalid framebuffer");
+    return false;
+  }
+  // Make filename with timestamp (millis since boot). If you want real time, integrate RTC or get time from NTP.
+  String filename = "/img_" + String(millis()) + ".jpg";
+  fs::FS &fs = SD_MMC;
+
+  File file = fs.open(filename.c_str(), FILE_WRITE);
+  if (!file) {
+    Serial.printf("Failed to open file %s for writing\n", filename.c_str());
+    return false;
+  }
+
+  size_t written = file.write(fb->buf, fb->len);
+  file.close();
+  if (written != fb->len) {
+    Serial.printf("Warning: wrote %u of %u bytes to SD\n", written, fb->len);
+    return false;
+  }
+
+  outPath = filename;
+  Serial.printf("Saved file to SD: %s (size: %u bytes)\n", filename.c_str(), fb->len);
+  return true;
+}
+
 // ----------------- Helper functions -----------------
 void buzzOnce(int times, int onMs = 150, int offMs = 100) {
   for (int i=0; i<times; ++i) {
@@ -127,15 +167,33 @@ bool postJPEGtoServer(const uint8_t* buf, size_t len, const char* reason) {
   return (httpCode >= 200 && httpCode < 300);
 }
 
-void captureAndSendLocal(const char* reason) {
+// Capture, save to SD, then post( optional )
+void captureSaveAndOptionalPost(const char* reason) {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed!");
     return;
   }
-  Serial.printf("Captured %u bytes (local)\n", fb->len);
-  // Optionally POST to external server if configured
-  postJPEGtoServer(fb->buf, fb->len, reason);
+
+  // 1) Save to SD if available
+  String savedPath = "";
+  if (SD_MMC.cardType() != CARD_NONE) {
+    if (savePhotoToSD(fb, savedPath)) {
+      Serial.printf("Photo saved to SD: %s\n", savedPath.c_str());
+    } else {
+      Serial.println("Failed to save photo to SD");
+    }
+  } else {
+    Serial.println("No SD card mounted; skipping save");
+  }
+
+  // 2) Optionally POST to server
+  if (strlen(SERVER_UPLOAD_URL) > 0) {
+    bool ok = postJPEGtoServer(fb->buf, fb->len, reason);
+    if (ok) Serial.println("Image posted successfully");
+    else Serial.println("Image post failed");
+  }
+
   esp_camera_fb_return(fb);
 }
 
@@ -147,18 +205,30 @@ void handleRoot() {
   html += "<h2>ESP32-CAM (OV2640)</h2>";
   html += "<p><a href=\"/capture\">Capture single photo</a></p>";
   html += "<p><a href=\"/stream\">Live stream (MJPEG)</a></p>";
-  html += "<p>Use <code>/capture</code> to download a snapshot as JPEG.</p>";
-  html += "</body></html>";
+  html += "<p>SD status: ";
+  if (SD_MMC.cardType() == CARD_NONE) html += "<b>Not mounted</b>";
+  else {
+    html += "<b>Mounted</b>";
+    // Optionally show list of images
+  }
+  html += "</p></body></html>";
   server.send(200, "text/html", html);
 }
 
-// Capture single JPEG and send as image/jpeg
+// Capture single JPEG and send as image/jpeg (also saves to SD)
 void handleCapture() {
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
     server.send(500, "text/plain", "Camera capture failed");
     return;
   }
+
+  // Try save to SD as well
+  String savedPath = "";
+  if (SD_MMC.cardType() != CARD_NONE) {
+    savePhotoToSD(fb, savedPath);
+  }
+
   server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
   server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
   esp_camera_fb_return(fb);
@@ -223,6 +293,14 @@ void setup() {
     particleSensor.setup();
     particleSensor.setPulseAmplitudeRed(0x0A);
     particleSensor.setPulseAmplitudeGreen(0);
+  }
+
+  // Initialize SD card
+  Serial.println("Initializing SD card (SD_MMC)...");
+  if (initSD()) {
+    Serial.println("SD mounted successfully.");
+  } else {
+    Serial.println("SD mount failed - continuing without SD.");
   }
 
   // Camera
@@ -312,8 +390,8 @@ void loop() {
     if (pir) {
       Serial.println("Fall confirmed (spike + PIR). Triggering actions.");
       buzzOnce(3, 150, 120);
-      // capture and optionally POST if SERVER_UPLOAD_URL set
-      captureAndSendLocal("fall_detected");
+      // capture, save to SD, and optionally POST
+      captureSaveAndOptionalPost("fall_detected");
       spikeSeen = false;
       delay(1200);
     }
@@ -334,7 +412,7 @@ void loop() {
       if (currentBPM < HR_LOW || currentBPM > HR_HIGH) {
         Serial.printf("HR out of range: %.1f bpm — local alert\n", currentBPM);
         buzzOnce(1, 200, 100);
-        captureAndSendLocal("heart_rate_alert");
+        captureSaveAndOptionalPost("heart_rate_alert");
       } else {
         Serial.printf("HR OK: %.1f bpm\n", currentBPM);
       }
